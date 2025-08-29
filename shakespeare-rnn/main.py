@@ -1,91 +1,102 @@
-from tinygrad import Tensor, TinyJit
+from tinygrad import Tensor 
 import tinygrad.nn as nn
-from tinygrad.helpers import GlobalCounters, getenv, trange 
-from typing import List
+from tinygrad.helpers import GlobalCounters, getenv, trange
+from typing import List, Tuple
 from pathlib import Path
 from utils import make_blocks
-import math
 
 class CharTokenizer:
   def __init__(self, path: Path):
     self.unique = sorted(set(path.open().read()))
-    self.vocab = {self.unique[i]: i for i in range(len(self.unique))}
-    self.r_vocab = {i: self.unique[i] for i in range(len(self.unique))}
-  def encode(self, s: str) -> List[int]: return list(map(lambda x: self.vocab[x], list(s)))
-  def decode(self, ids: List[int]) -> str:
-    return "".join(self.r_vocab[i] for i in ids)
-  def vocab_size(self) -> int: return len(self.unique)
+    self.vocab = {ch:i for i, ch in enumerate(self.unique)}
+    self.r_vocab = {i: ch for i, ch in enumerate(self.unique)}
+  def encode(self, s: str): return [self.vocab[x] for x in s]
+  def decode(self, ids): return "".join(self.r_vocab[i] for i in ids)
+  def vocab_size(self): return len(self.unique)
 
 dataset = Path(__file__).parent.parent / "datasets" / "shakespeare.txt"
 tokenizer = CharTokenizer(dataset)
 
 class LSTMCell:
-  def __init__(self, input_size: int, hidden_size: int, bias:bool=False):
-    stdv = 1.0 / math.sqrt(hidden_size)
-    self.weight_ih = Tensor.uniform(hidden_size*4, input_size, low=-stdv, high=stdv)
-    self.weight_hh = Tensor.uniform(hidden_size*4, hidden_size, low=-stdv, high=stdv)
-    self.bias_ih: Tensor|None = Tensor.zeros(hidden_size*4) if bias else None
-    self.bias_hh: Tensor|None = Tensor.zeros(hidden_size*4) if bias else None
-    self.H = hidden_size
-  def __call__(self, x: Tensor, hc: tuple[Tensor, Tensor]|None = None) -> tuple[Tensor, Tensor]:
-    h_prev, c_prev = hc if hc is not None else (Tensor.zeros(x.size(0), self.H), Tensor.zeros(x.size(0), self.H))
-    gates = x.linear(self.weight_ih.T, self.bias_ih) + h_prev.linear(self.weight_hh.T, self.bias_hh)
-    i,f,g,o = gates.chunk(4, dim=1)
-    i,f,g,o = i.sigmoid(), f.sigmoid(), g.tanh(), o.sigmoid()
+  def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.0):
+    self.hidden_size = hidden_size
+    self.dropout = dropout
+    # using nn.Linear guarantees parameters are discoverable by nn.state.get_parameters
+    self.x2g = nn.Linear(input_size, 4*hidden_size, bias=True)
+    self.h2g = nn.Linear(hidden_size, 4*hidden_size, bias=True)
 
-    # these are element-wise, the gates are 0..1 
-    c = f * c_prev + i * g 
-    h = o * c.tanh()
-    # return hidden state and cell state for this timestep
-    return (h, c)
+  def __call__(self, x: Tensor, h: Tensor, c: Tensor):
+    # x: (B, I), h,c: (B, H)
+    gates = self.x2g(x) + self.h2g(h)           # (B, 4H)
+    i, f, g, o = gates.chunk(4, 1)              # split along channel dim
+    i, f, g, o = i.sigmoid(), f.sigmoid(), g.tanh(), o.sigmoid()
+    c_new = f * c + i * g
+    h_new = o * c_new.tanh()
+    if self.dropout and self.dropout > 0:
+      h_new = h_new.dropout(self.dropout)
+    return h_new, c_new
 
-# loops over LSTMCell and contains entire network
 class LSTM:
-  def __init__(self, n_layers:int=4, emb_dim:int=128, hidden:int=128, n_ctx:int=256):
-    self.n_ctx = n_ctx
-    self.n_layers = n_layers
-    self.hidden = hidden
-    self.emb = nn.Embedding(tokenizer.vocab_size(), emb_dim)
-    self.lstms = [LSTMCell(input_size=(emb_dim if i==0 else hidden), hidden_size=hidden, bias=True) for i in range(n_layers)]
-    self.lin = nn.Linear(hidden, tokenizer.vocab_size()) # .shape = (65, 128)
-  def __call__(self, x: Tensor, targets: Tensor) -> Tensor:
-    x = self.emb(x) 
-    
-    # run through all lstm cells per timestep, build one hidden state and cell state per LSTM cell 
-    logits_ts = [] # logits per time step for loss calculation
-    h = [Tensor.zeros(x.size(0), self.hidden) for _ in range(self.n_layers)] 
-    c = [Tensor.zeros(x.size(0), self.hidden) for _ in range(self.n_layers)] 
+  def __init__(self, vocab_size: int, embed_size: int, hidden_size: int, layers: int = 1, dropout: float = 0.0):
+    # These are all attached to self, so the optimizer can find them
+    self.embed = nn.Embedding(vocab_size, embed_size)
+    self.cells = [LSTMCell(embed_size if l==0 else hidden_size, hidden_size, dropout=dropout) for l in range(layers)]
+    self.proj = nn.Linear(hidden_size, vocab_size, bias=True)
+    self.hidden_size = hidden_size
+    self.layers = layers
+    self.dropout = dropout
 
-    for t in range(self.n_ctx): # run n_ctx generation attempts (same as T) 
-      inp = x[:, t, :] # inp.shape = (B, C) -- select all embeddings @ batch for index t
-      for i, cell in enumerate(self.lstms): # run through each lstm 
-        h[i], c[i] = cell(inp, (h[i], c[i]))
-        inp = h[i]
-      logits_ts.append(self.lin(inp))
-    
-    logits = Tensor.stack(*logits_ts, dim=1)
+  def __call__(self, X: Tensor, hc=None):
+    # X: (B, T) int tokens
+    B, T = X.shape
+    # Embedding: (B, T, E)
+    E = self.embed(X)
 
-    return logits.reshape(x.size(0)*x.size(1), tokenizer.vocab_size()).cross_entropy(targets.reshape(x.size(0)*x.size(1)))
+    # init states if not provided; you usually don't want grads on initial h0/c0
+    if hc is None:
+      hs = [Tensor.zeros(B, self.hidden_size) for _ in range(self.layers)]
+      cs = [Tensor.zeros(B, self.hidden_size) for _ in range(self.layers)]
+    else:
+      hs, cs = hc
+
+    logits_t = []
+    for t in range(T):
+      inp = E[:, t, :]                         # (B, E) or (B, H) as we go deeper
+      for l, cell in enumerate(self.cells):
+        hs[l], cs[l] = cell(inp, hs[l], cs[l]) # (B, H), (B, H)
+        inp = hs[l]
+      logits_t.append(self.proj(inp))          # append (B, V)
+
+    # (B, T, V)
+    logits = Tensor.stack(logits_t, dim=1)
+    return logits, (hs, cs)
+
 
 if __name__ == "__main__":
-  X_train, Y_train, X_test, Y_test = make_blocks(token_ids=tokenizer.encode(dataset.open().read())) 
+  X_train, Y_train, X_test, Y_test = make_blocks(token_ids=tokenizer.encode(dataset.open().read()))
 
-  model = LSTM()
+  # X_train, Y_train: (N, T) int tokens
+  model = LSTM(vocab_size=tokenizer.vocab_size(), embed_size=256, hidden_size=128, layers=2, dropout=0.1)
+  opt = nn.optim.AdamW(nn.state.get_parameters(model), lr=3e-4)
 
-  opt = nn.optim.AdamW(nn.state.get_parameters(model))
-
-  @TinyJit
-  @Tensor.train(True)
-  def train_step() -> Tensor:
+  @Tensor.train()
+  def train_step():
     opt.zero_grad()
-    samples = Tensor.randint(128, high=X_train.shape[0])
-    loss = model(X_train[samples], Y_train[samples]).backward()
-    return loss.realize(*opt.schedule_step())
+    # batch of sequences
+    idx = Tensor.randint(128, high=X_train.shape[0])
+    Xb, Yb = X_train[idx], Y_train[idx]              # (B, T)
 
-  @TinyJit
-  @Tensor.train(False)
-  def get_val_ppl() -> Tensor:
-    val_loss = model(X_test, Y_test)
+    logits, _ = model(Xb)                            # (B, T, V)
+    B, T, V = logits.shape
+    loss = logits.reshape(B*T, V).sparse_categorical_crossentropy(Yb.reshape(B*T)).mean()
+    loss.backward()
+    opt.step()
+    return loss
+
+  def val_ppl():
+    logits, _ = model(X_test)
+    B, T, V = logits.shape
+    val_loss = logits.reshape(B*T, V).sparse_categorical_crossentropy(Y_test.reshape(B*T)).mean()
     return val_loss.exp()
 
   test_ppl = float('nan')
@@ -93,5 +104,5 @@ if __name__ == "__main__":
     GlobalCounters.reset()
     loss = train_step()
     t.set_description(f"loss: {loss.item():6.2f} val_ppl: {test_ppl:.2f}")
-    if i % 50 == 49: 
-      test_ppl = get_val_ppl().item()
+    if i % 50 == 49:
+      test_ppl = val_ppl().item()
