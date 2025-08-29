@@ -4,6 +4,7 @@ from tinygrad.helpers import trange
 import sentencepiece as spm
 from pathlib import Path
 import math
+from utils import make_blocks
 
 N_CTX  = 512 
 D_emb  = 256
@@ -12,14 +13,14 @@ d_ff   = 4 * D_emb
 n_layers = 6
 VOCAB_SIZE = 1024 # tokenizer size
 
-TEXT_PATH = Path(__file__).parent / "shakespeare.txt"
+raw_text = (Path(__file__).parent.parent / "datasets" / "shakespeare.txt").open().read()
 SPM_MODEL = Path(__file__).parent / "shakes_sp.model"
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 if not SPM_MODEL.exists():
   spm.SentencePieceTrainer.Train(
-      input=str(TEXT_PATH),
+      input=raw_text,
       model_prefix=str(SPM_MODEL.with_suffix("")),
       vocab_size=VOCAB_SIZE,
       model_type="bpe",
@@ -83,19 +84,6 @@ class Transformer:
     logits = x @ self.wte.weight.transpose(1, 0)
     return logits
 
-def make_blocks(token_ids, block_size: int = 256, stride: int = 64):
-  X, y = [], []
-  for i in range(0, len(token_ids) - block_size - 1, stride):
-    x = token_ids[i : i + block_size]
-    Y = token_ids[i + 1 : i + block_size + 1]
-    X.append(x)
-    y.append(Y)
-  num_samples = len(X)
-  train_size = int(num_samples * 0.9)
-  X_train, Y_train = X[:train_size], y[:train_size]
-  X_test,  Y_test  = X[train_size:], y[train_size:]
-  return Tensor(X_train), Tensor(Y_train), Tensor(X_test), Tensor(Y_test)
-
 def generate(epoch: int, prompt: str = "", max_tokens: int = 256, temperature: float = 1.0, top_k: int = 50):
   state_dict = nn.state.safe_load(str(CHECKPOINT_DIR / f"model{epoch}.safetensors"))
   model = Transformer()
@@ -158,8 +146,7 @@ if __name__ == "__main__":
     generate(epoch=int(sys.argv[2]), prompt="to be or not to be ")
     sys.exit(0)
 
-  raw_text = TEXT_PATH.read_text(encoding="utf-8")
-  token_ids = sp_encode_ids(raw_text)
+  token_ids = sp_encode_ids(text=raw_text)
 
   X_train, Y_train, X_test, Y_test = make_blocks(token_ids, block_size=N_CTX, stride=128)
 
